@@ -379,7 +379,7 @@
                     <h3 class="text-xs font-bold uppercase tracking-wider text-slate">Gemini-Schlüssel für den Etiketten-Scan</h3>
                     <p class="text-xs text-muted mt-1 leading-relaxed">Hol dir einen kostenlosen Schlüssel bei <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener" class="text-bordeaux font-semibold underline">Google AI Studio</a> und füge ihn hier ein. Er wird nur auf diesem Gerät gespeichert und nirgendwo sonst hin geschickt außer an Google.</p>
                 </div>
-                <input type="password" id="settings-api-key" placeholder="AIza..." autocomplete="off" autocapitalize="off" spellcheck="false"
+                <input type="password" id="settings-api-key" placeholder="Schlüssel hier einfügen (AIza… oder AQ…)" autocomplete="off" autocapitalize="off" spellcheck="false"
                     class="w-full bg-cream border border-sand rounded-xl px-3.5 py-2.5 text-sm text-slate focus:outline-none focus:border-bordeaux select-text">
                 <label class="flex items-center gap-2 text-xs text-muted">
                     <input type="checkbox" onchange="document.getElementById('settings-api-key').type = this.checked ? 'text' : 'password'"> Schlüssel anzeigen
@@ -396,6 +396,7 @@
                     <button onclick="testApiKey()" class="bg-sand text-slate py-3 rounded-2xl text-sm font-semibold active:scale-95 transition-transform">Verbindung testen</button>
                 </div>
                 <button onclick="deleteApiKey()" class="w-full text-xs text-red-600 font-medium py-1">Schlüssel von diesem Gerät löschen</button>
+                <p class="text-center text-[11px] text-muted">App-Version <span id="app-version"></span></p>
             </div>
         </div>
     </div>
@@ -728,36 +729,13 @@ Gib alle Informationen verständlich, sympathisch und ohne unnötiges Fachchines
                 return;
             }
 
-            // Exponential Backoff Retry-Logik
-            const delays = [1000, 2000, 4000];
-            let responseData = null;
-
-            for (let attempt = 0; attempt <= delays.length; attempt++) {
-                try {
-                    const response = await callGemini(apiKey, payload);
-
-                    if (response.status === 400 || response.status === 401 || response.status === 403) {
-                        loadingEl.classList.add('hidden');
-                        showToast('Gemini-Schlüssel ungültig – bitte in den Einstellungen prüfen.', '🔑');
-                        return;
-                    }
-                    if (!response.ok) {
-                        throw new Error(`HTTP ${response.status}`);
-                    }
-
-                    responseData = await response.json();
-                    break;
-                } catch (err) {
-                    if (attempt === delays.length) {
-                        loadingEl.classList.add('hidden');
-                        showToast(navigator.onLine === false
-                            ? 'Kein Internet – bitte kurz manuell ausfüllen.'
-                            : 'KI-Erkennung gerade nicht erreichbar – bitte kurz manuell ausfüllen.', '🍷');
-                        return;
-                    }
-                    await new Promise(res => setTimeout(res, delays[attempt]));
-                }
+            const result = await geminiRequest(apiKey, payload);
+            if (!result.ok) {
+                loadingEl.classList.add('hidden');
+                showToast(result.message + ' Bitte kurz manuell ausfüllen.', result.kind === 'key' ? '🔑' : '🍷');
+                return;
             }
+            const responseData = result.data;
 
             loadingEl.classList.add('hidden');
 
@@ -1162,22 +1140,82 @@ Gib alle Informationen verständlich, sympathisch und ohne unnötiges Fachchines
         const API_KEY_STORAGE = 'vinolog_gemini_key';
         const MODEL_STORAGE = 'vinolog_gemini_model';
         const DEFAULT_MODEL = 'gemini-flash-latest';
+        const APP_VERSION = '3';
 
         function getApiKey() {
-            try { return (localStorage.getItem(API_KEY_STORAGE) || '').trim(); } catch (e) { return ''; }
+            try { return cleanKey(localStorage.getItem(API_KEY_STORAGE)); } catch (e) { return ''; }
         }
 
         function getModel() {
             try { return (localStorage.getItem(MODEL_STORAGE) || '').trim() || DEFAULT_MODEL; } catch (e) { return DEFAULT_MODEL; }
         }
 
-        function callGemini(apiKey, payload) {
-            const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(getModel())}:generateContent`;
-            return fetch(url, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-                body: JSON.stringify(payload)
-            });
+        // Ausweich-Modelle, falls eines überlastet ist (Fehler 503) oder nicht existiert (404)
+        const FALLBACK_MODELS = ['gemini-flash-latest', 'gemini-2.5-flash', 'gemini-flash-lite-latest', 'gemini-2.5-flash-lite'];
+
+        function cleanKey(key) {
+            // Entfernt Leerzeichen, Zeilenumbrüche und versehentliche Anführungszeichen beim Einfügen
+            return (key || '').replace(/[\s"'`]/g, '');
+        }
+
+        async function readGoogleError(response) {
+            try {
+                const body = await response.json();
+                return { msg: body?.error?.message || '', reason: (body?.error?.details || []).map(d => d.reason).filter(Boolean).join(',') };
+            } catch (e) { return { msg: '', reason: '' }; }
+        }
+
+        // Fragt Gemini an. Wiederholt bei Überlastung und weicht auf andere Modelle aus.
+        // Ergebnis: { ok, data, kind: 'key'|'busy'|'quota'|'offline'|'other', message, model }
+        async function geminiRequest(apiKey, payload, options = {}) {
+            const key = cleanKey(apiKey);
+            const custom = options.model !== undefined ? options.model : (localStorage.getItem(MODEL_STORAGE) || '').trim();
+            const models = custom ? [custom, ...FALLBACK_MODELS.filter(m => m !== custom)] : FALLBACK_MODELS;
+            const delays = options.quick ? [800] : [1000, 2500];
+            let last = { ok: false, kind: 'other', message: 'KI-Erkennung gerade nicht erreichbar.' };
+
+            for (const model of models) {
+                for (let attempt = 0; attempt <= delays.length; attempt++) {
+                    let response;
+                    try {
+                        response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+                            body: JSON.stringify(payload)
+                        });
+                    } catch (e) {
+                        return { ok: false, kind: 'offline', message: 'Keine Verbindung zu Google. Bist du online?' };
+                    }
+
+                    if (response.ok) {
+                        return { ok: true, data: await response.json(), model };
+                    }
+
+                    const status = response.status;
+                    const err = await readGoogleError(response);
+                    console.warn('Gemini', model, status, err.msg);
+                    const detail = err.msg ? ` (Google: ${err.msg})` : '';
+
+                    if (status === 401 || status === 403 || (status === 400 && /API_KEY|api key|credential|auth/i.test(err.reason + ' ' + err.msg))) {
+                        return { ok: false, kind: 'key', message: `Schlüssel wird nicht akzeptiert (Fehler ${status})${detail}` };
+                    }
+                    if (status === 404) { // Modell gibt es nicht (mehr) -> nächstes Modell
+                        last = { ok: false, kind: 'other', message: `KI-Modell „${model}“ nicht gefunden.` };
+                        break;
+                    }
+                    if (status === 429) {
+                        last = { ok: false, kind: 'quota', message: 'Gratis-Kontingent gerade aufgebraucht – in einer Minute nochmal versuchen.' };
+                        break; // anderes Modell hat eigenes Kontingent
+                    }
+                    if (status === 500 || status === 502 || status === 503 || status === 504) {
+                        last = { ok: false, kind: 'busy', message: 'Google-KI ist gerade überlastet – bitte gleich nochmal versuchen.' };
+                        if (attempt < delays.length) { await new Promise(r => setTimeout(r, delays[attempt])); continue; }
+                        break; // nächstes Modell
+                    }
+                    return { ok: false, kind: 'other', message: `Unerwarteter Fehler ${status}${detail}` };
+                }
+            }
+            return last;
         }
 
         function setSettingsStatus(text, ok) {
@@ -1192,6 +1230,7 @@ Gib alle Informationen verständlich, sympathisch und ohne unnötiges Fachchines
             try { model = localStorage.getItem(MODEL_STORAGE) || ''; } catch (e) {}
             document.getElementById('settings-model').value = model;
             setSettingsStatus(getApiKey() ? 'Ein Schlüssel ist auf diesem Gerät gespeichert.' : 'Noch kein Schlüssel gespeichert.');
+            document.getElementById('app-version').textContent = APP_VERSION;
             document.getElementById('settings-modal').classList.remove('hidden');
         }
 
@@ -1200,7 +1239,7 @@ Gib alle Informationen verständlich, sympathisch und ohne unnötiges Fachchines
         }
 
         function saveSettings() {
-            const key = document.getElementById('settings-api-key').value.trim();
+            const key = cleanKey(document.getElementById('settings-api-key').value);
             const model = document.getElementById('settings-model').value.trim();
             try {
                 if (key) localStorage.setItem(API_KEY_STORAGE, key); else localStorage.removeItem(API_KEY_STORAGE);
@@ -1219,30 +1258,33 @@ Gib alle Informationen verständlich, sympathisch und ohne unnötiges Fachchines
         }
 
         async function testApiKey() {
-            const key = document.getElementById('settings-api-key').value.trim();
+            const key = cleanKey(document.getElementById('settings-api-key').value);
             if (!key) { setSettingsStatus('Bitte zuerst einen Schlüssel einfügen.', false); return; }
-            const modelInput = document.getElementById('settings-model').value.trim();
-            setSettingsStatus('Teste Verbindung…');
-            try {
-                const model = modelInput || DEFAULT_MODEL;
-                const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-                    body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'Antworte nur mit OK.' }] }] })
-                });
-                if (res.ok) setSettingsStatus('Verbindung klappt! Jetzt noch „Speichern“ tippen.', true);
-                else if (res.status === 404) setSettingsStatus('Schlüssel ok, aber das KI-Modell gibt es nicht. Feld „KI-Modell“ leeren.', false);
-                else if (res.status === 429) setSettingsStatus('Schlüssel ok, aber gerade zu viele Anfragen. Später nochmal.', true);
-                else setSettingsStatus('Schlüssel wird nicht akzeptiert (Fehler ' + res.status + ').', false);
-            } catch (e) {
-                setSettingsStatus('Keine Verbindung zu Google. Bist du online?', false);
-            }
+            const model = document.getElementById('settings-model').value.trim();
+            setSettingsStatus('Teste Verbindung… (kann bei Überlastung ein paar Sekunden dauern)');
+            const r = await geminiRequest(key, { contents: [{ role: 'user', parts: [{ text: 'Antworte nur mit OK.' }] }] }, { quick: true, model });
+            if (r.ok) setSettingsStatus(`Verbindung klappt (Modell: ${r.model})! Jetzt noch „Speichern“ tippen.`, true);
+            else if (r.kind === 'busy' || r.kind === 'quota') setSettingsStatus('Schlüssel ist wahrscheinlich ok. ' + r.message, null);
+            else setSettingsStatus(r.message, false);
         }
 
         // Offline-Modus & dauerhafter Speicher
         if ('serviceWorker' in navigator && location.protocol === 'https:') {
             window.addEventListener('load', () => {
-                navigator.serviceWorker.register('sw.js').catch(err => console.warn('Service Worker:', err));
+                navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then(reg => {
+                    // Beim Zurückkehren in die App nach Updates suchen
+                    document.addEventListener('visibilitychange', () => {
+                        if (document.visibilityState === 'visible') reg.update().catch(() => {});
+                    });
+                }).catch(err => console.warn('Service Worker:', err));
+                // Neue Version aktiv geworden -> einmal neu laden
+                let reloaded = false;
+                const hadController = !!navigator.serviceWorker.controller;
+                navigator.serviceWorker.addEventListener('controllerchange', () => {
+                    if (!hadController || reloaded) return;
+                    reloaded = true;
+                    location.reload();
+                });
             });
         }
         if (navigator.storage && navigator.storage.persist) {

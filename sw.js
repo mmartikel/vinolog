@@ -1,6 +1,6 @@
 // VinoLog Service Worker: macht die App offline nutzbar.
 // Bei Änderungen an der App die Versionsnummer erhöhen.
-const CACHE = 'vinolog-v1';
+const CACHE = 'vinolog-v3';
 const APP_FILES = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png', './apple-touch-icon.png'];
 
 self.addEventListener('install', (event) => {
@@ -25,7 +25,7 @@ self.addEventListener('fetch', (event) => {
   // Eigene Seite: erst online versuchen (damit Updates ankommen), sonst Cache
   if (req.mode === 'navigate' || url.origin === self.location.origin) {
     event.respondWith(
-      fetch(req)
+      fetch(req, { cache: 'no-store' }) // immer die neueste Version von GitHub holen
         .then((res) => {
           const copy = res.clone();
           caches.open(CACHE).then((c) => c.put(req, copy));
