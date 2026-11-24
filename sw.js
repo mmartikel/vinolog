@@ -1,6 +1,6 @@
 // VinoLog Service Worker: macht die App offline nutzbar.
 // Bei Änderungen an der App die Versionsnummer erhöhen.
-const CACHE = 'vinolog-v3';
+const CACHE = 'vinolog-v4';
 const APP_FILES = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png', './apple-touch-icon.png'];
 
 self.addEventListener('install', (event) => {
