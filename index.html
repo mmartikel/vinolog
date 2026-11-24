@@ -388,7 +388,7 @@
                     <summary class="cursor-pointer">Erweitert: KI-Modell</summary>
                     <input type="text" id="settings-model" placeholder="gemini-flash-latest" autocomplete="off" autocapitalize="off" spellcheck="false"
                         class="mt-2 w-full bg-cream border border-sand rounded-xl px-3.5 py-2 text-sm text-slate focus:outline-none focus:border-bordeaux select-text">
-                    <p class="mt-1">Leer lassen für die Standardeinstellung.</p>
+                    <p class="mt-1">Leer lassen: Die App sucht sich selbst ein passendes Modell.</p>
                 </details>
                 <p id="settings-status" class="text-xs font-medium text-muted"></p>
                 <div class="grid grid-cols-2 gap-2.5">
@@ -1140,7 +1140,7 @@ Gib alle Informationen verständlich, sympathisch und ohne unnötiges Fachchines
         const API_KEY_STORAGE = 'vinolog_gemini_key';
         const MODEL_STORAGE = 'vinolog_gemini_model';
         const DEFAULT_MODEL = 'gemini-flash-latest';
-        const APP_VERSION = '3';
+        const APP_VERSION = '4';
 
         function getApiKey() {
             try { return cleanKey(localStorage.getItem(API_KEY_STORAGE)); } catch (e) { return ''; }
@@ -1165,14 +1165,75 @@ Gib alle Informationen verständlich, sympathisch und ohne unnötiges Fachchines
             } catch (e) { return { msg: '', reason: '' }; }
         }
 
-        // Fragt Gemini an. Wiederholt bei Überlastung und weicht auf andere Modelle aus.
+        // Fragt bei Google ab, welche Modelle dieser Schlüssel nutzen darf (12 Std. zwischengespeichert)
+        const MODELS_CACHE = 'vinolog_models_cache';
+        async function getAvailableModels(key, forceRefresh = false) {
+            const keyTag = key.slice(-6);
+            if (!forceRefresh) {
+                try {
+                    const c = JSON.parse(localStorage.getItem(MODELS_CACHE) || 'null');
+                    if (c && c.keyTag === keyTag && Date.now() - c.time < 12 * 3600 * 1000 && c.models.length) return c.models;
+                } catch (e) {}
+            }
+            let names = [];
+            let pageToken = '';
+            for (let page = 0; page < 5; page++) {
+                const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000' + (pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : ''), {
+                    headers: { 'x-goog-api-key': key }
+                });
+                if (!res.ok) { const e = new Error('list ' + res.status); e.status = res.status; e.google = await readGoogleError(res); throw e; }
+                const body = await res.json();
+                (body.models || []).forEach(m => {
+                    if ((m.supportedGenerationMethods || []).includes('generateContent')) names.push((m.name || '').replace(/^models\//, ''));
+                });
+                pageToken = body.nextPageToken;
+                if (!pageToken) break;
+            }
+            const models = rankModels(names);
+            try { localStorage.setItem(MODELS_CACHE, JSON.stringify({ keyTag, time: Date.now(), models })); } catch (e) {}
+            return models;
+        }
+
+        // Sortiert: Flash zuerst, dann Flash-Lite, dann Pro; stabile vor Vorschau; neuere Version vor älterer
+        function rankModels(names) {
+            const usable = names.filter(n => /^gemini/.test(n) && !/(tts|image|live|audio|embed|robotics|computer|native|aqa|learnlm|nano|veo|imagen|exp)/i.test(n));
+            const score = n => {
+                const tier = /flash-lite/.test(n) ? 1 : /flash/.test(n) ? 0 : /pro/.test(n) ? 2 : 3;
+                const preview = /preview/.test(n) ? 1 : 0;
+                const latest = /latest/.test(n) ? 0 : 1;
+                const ver = parseFloat((n.match(/gemini-(\d+(\.\d+)?)/) || [])[1] || '0');
+                return [tier, preview, latest, -ver];
+            };
+            return usable.sort((x, y) => {
+                const a = score(x), b = score(y);
+                for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return a[i] - b[i];
+                return x.localeCompare(y);
+            });
+        }
+
+        // Fragt Gemini an. Sucht selbst passende Modelle, wiederholt bei Überlastung und weicht aus.
         // Ergebnis: { ok, data, kind: 'key'|'busy'|'quota'|'offline'|'other', message, model }
         async function geminiRequest(apiKey, payload, options = {}) {
             const key = cleanKey(apiKey);
             const custom = options.model !== undefined ? options.model : (localStorage.getItem(MODEL_STORAGE) || '').trim();
-            const models = custom ? [custom, ...FALLBACK_MODELS.filter(m => m !== custom)] : FALLBACK_MODELS;
+
+            let available = [];
+            try {
+                available = await getAvailableModels(key, options.refresh);
+            } catch (e) {
+                if (e.status === undefined) return { ok: false, kind: 'offline', message: 'Keine Verbindung zu Google. Bist du online?' };
+                const g = e.google || {};
+                if (e.status === 401 || e.status === 403 || (e.status === 400 && /API_KEY|api key|credential|auth/i.test((g.reason || '') + ' ' + (g.msg || '')))) {
+                    return { ok: false, kind: 'key', message: `Schlüssel wird nicht akzeptiert (Fehler ${e.status})${g.msg ? ' (Google: ' + g.msg + ')' : ''}` };
+                }
+                // Liste gerade nicht abrufbar -> feste Namen probieren
+            }
+            let models = available.length ? available.slice(0, 5) : FALLBACK_MODELS;
+            if (custom) models = [custom, ...models.filter(m => m !== custom)];
+
             const delays = options.quick ? [800] : [1000, 2500];
-            let last = { ok: false, kind: 'other', message: 'KI-Erkennung gerade nicht erreichbar.' };
+            const tried = [];
+            let sawBusy = false, sawQuota = false, lastDetail = '';
 
             for (const model of models) {
                 for (let attempt = 0; attempt <= delays.length; attempt++) {
@@ -1187,35 +1248,32 @@ Gib alle Informationen verständlich, sympathisch und ohne unnötiges Fachchines
                         return { ok: false, kind: 'offline', message: 'Keine Verbindung zu Google. Bist du online?' };
                     }
 
-                    if (response.ok) {
-                        return { ok: true, data: await response.json(), model };
-                    }
+                    if (response.ok) return { ok: true, data: await response.json(), model };
 
                     const status = response.status;
                     const err = await readGoogleError(response);
                     console.warn('Gemini', model, status, err.msg);
-                    const detail = err.msg ? ` (Google: ${err.msg})` : '';
+                    if (err.msg) lastDetail = err.msg;
 
                     if (status === 401 || status === 403 || (status === 400 && /API_KEY|api key|credential|auth/i.test(err.reason + ' ' + err.msg))) {
-                        return { ok: false, kind: 'key', message: `Schlüssel wird nicht akzeptiert (Fehler ${status})${detail}` };
+                        return { ok: false, kind: 'key', message: `Schlüssel wird nicht akzeptiert (Fehler ${status})${err.msg ? ' (Google: ' + err.msg + ')' : ''}` };
                     }
-                    if (status === 404) { // Modell gibt es nicht (mehr) -> nächstes Modell
-                        last = { ok: false, kind: 'other', message: `KI-Modell „${model}“ nicht gefunden.` };
-                        break;
+                    if ([500, 502, 503, 504].includes(status) && attempt < delays.length) {
+                        await new Promise(r => setTimeout(r, delays[attempt]));
+                        continue;
                     }
-                    if (status === 429) {
-                        last = { ok: false, kind: 'quota', message: 'Gratis-Kontingent gerade aufgebraucht – in einer Minute nochmal versuchen.' };
-                        break; // anderes Modell hat eigenes Kontingent
-                    }
-                    if (status === 500 || status === 502 || status === 503 || status === 504) {
-                        last = { ok: false, kind: 'busy', message: 'Google-KI ist gerade überlastet – bitte gleich nochmal versuchen.' };
-                        if (attempt < delays.length) { await new Promise(r => setTimeout(r, delays[attempt])); continue; }
-                        break; // nächstes Modell
-                    }
-                    return { ok: false, kind: 'other', message: `Unerwarteter Fehler ${status}${detail}` };
+                    if ([500, 502, 503, 504].includes(status)) sawBusy = true;
+                    if (status === 429) sawQuota = true;
+                    tried.push(`${model}: ${status}`);
+                    break; // nächstes Modell probieren
                 }
             }
-            return last;
+
+            try { localStorage.removeItem(MODELS_CACHE); } catch (e) {} // beim nächsten Mal Liste neu holen
+            const triedText = tried.length ? ` [Versucht: ${tried.join(', ')}]` : '';
+            if (sawQuota) return { ok: false, kind: 'quota', message: 'Gratis-Kontingent gerade aufgebraucht – in ein paar Minuten nochmal versuchen.' + triedText };
+            if (sawBusy) return { ok: false, kind: 'busy', message: 'Google-KI ist gerade überlastet – bitte gleich nochmal versuchen.' + triedText };
+            return { ok: false, kind: 'other', message: 'Kein passendes KI-Modell gefunden.' + (lastDetail ? ' (Google: ' + lastDetail + ')' : '') + triedText };
         }
 
         function setSettingsStatus(text, ok) {
@@ -1262,7 +1320,7 @@ Gib alle Informationen verständlich, sympathisch und ohne unnötiges Fachchines
             if (!key) { setSettingsStatus('Bitte zuerst einen Schlüssel einfügen.', false); return; }
             const model = document.getElementById('settings-model').value.trim();
             setSettingsStatus('Teste Verbindung… (kann bei Überlastung ein paar Sekunden dauern)');
-            const r = await geminiRequest(key, { contents: [{ role: 'user', parts: [{ text: 'Antworte nur mit OK.' }] }] }, { quick: true, model });
+            const r = await geminiRequest(key, { contents: [{ role: 'user', parts: [{ text: 'Antworte nur mit OK.' }] }] }, { quick: true, model, refresh: true });
             if (r.ok) setSettingsStatus(`Verbindung klappt (Modell: ${r.model})! Jetzt noch „Speichern“ tippen.`, true);
             else if (r.kind === 'busy' || r.kind === 'quota') setSettingsStatus('Schlüssel ist wahrscheinlich ok. ' + r.message, null);
             else setSettingsStatus(r.message, false);
